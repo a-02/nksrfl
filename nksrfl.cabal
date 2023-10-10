@@ -1,0 +1,32 @@
+cabal-version:      3.0
+name:               nksrfl
+version:            0.1.0.0
+-- synopsis:
+-- description:
+license:            BSD-2-Clause
+license-file:       LICENSE
+author:             nks
+maintainer:         nks@9k.vc
+-- copyright:
+category:           Sound
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+-- extra-source-files:
+
+common warnings
+    ghc-options: -Wall
+
+executable nksrfl
+    import:           warnings
+    main-is:          Main.hs
+    -- other-modules:
+    -- other-extensions:
+    build-depends:    
+      base ^>=4.17.2.0,
+      hosc,
+      vty,
+      transformers,
+      these,
+      containers
+    hs-source-dirs:   app
+    default-language: Haskell2010
