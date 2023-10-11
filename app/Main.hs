@@ -16,29 +16,40 @@ import Data.IORef
 import Data.These
 import qualified Data.Sequence as Seq
 
-import Graphics.Vty
+import Graphics.Vty as Vty
+import Graphics.Vty.Image as Vty
 
 import Sound.Osc.Datum
 import Sound.Osc.Packet
 import Sound.Osc.Transport.Fd.Udp
 import Sound.Osc.Transport.Fd as Fd
 
+{-
+   The connections here are all over the place.
+   NKSRFL sends OSC messages to Renoise over port 6066.
+   NKSTool waits for any OSC message on port 8088,
+     then returns the current "track status" on port 9099.
+   NKSRFL keeps "track status" in an IORef. 
+   While technically any message can be put over 8088,
+     we use "/flowers []" here.
+   Track status gets sent over /nks/all.
+-}
+   
 type App = RWST Vty () (DeckState,DeckState) IO
 
 data DeckState = DeckState {
   socket :: Udp,
-  buffer :: IORef String,
+  buffer :: IORef TrackStatus,
   bpm :: Maybe Int,
   pattern :: Maybe Int,
   row :: Maybe Int,
   playing :: Bool,
   looping :: Bool,
-
   blockLooping :: Bool,
   blockSize :: Maybe BlockSize,
   transpose :: Int,
   songName :: String
-  }
+  } 
 
 dsEmpty :: DeckState
 dsEmpty = DeckState {
@@ -55,6 +66,13 @@ dsEmpty = DeckState {
     songName = ""
   }
 
+data TrackStatus = TrackStatus {
+  trackBpm :: Float,
+  trackPlaying :: String,
+  trackPosition :: String,
+  trackLooping :: String,
+  trackBlockLooping :: String
+} deriving Show
 
 data BlockSize = Half | Quarter | Eighth | Sixteenth
 
@@ -65,17 +83,6 @@ unBlockSize = \case
   Eighth -> 8
   Sixteenth -> 16
 
-{--
-oscBuffer :: IORef String -> Udp -> IO ()
-oscBuffer a t = forever $ do
-  pckt <- Fd.waitAddress t "/nks/all"
-  let unpackedMessage = case pckt of
-    Packet_Message msg -> messageDatum msg
-    Packet_Bundle bundle -> undefined
-  atomicWriteIORef a unpackedMessage
-  return ()
---}
-
 initScript :: IO (String, String)
 initScript = do
   putStrLn "deck 1 ip"
@@ -85,21 +92,53 @@ initScript = do
   return (one, two)
 
 rnsServerPort :: Int 
-rnsServerPort = 60606
+rnsServerPort = 6066
 nksServerPort :: Int
-nksServerPort = 60608
+nksServerPort = 8088
 nksClientPort :: Int
-nksClientPort = 60609
+nksClientPort = 9099
+
+messageToTrackStatus :: Message -> TrackStatus
+messageToTrackStatus msg = 
+  let datum = messageDatum msg
+      tsbpm = datumToFloat $ head datum
+      tsply = datumToString $ datum !! 1
+      tspos = datumToString $ datum !! 2
+      tslpn = datumToString $ datum !! 3
+      tsblk = datumToString $ datum !! 4
+      datumToFloat :: Datum -> Float
+      datumToFloat (Float f) = f
+      datumToFloat _ = 0
+      datumToString :: Datum -> String
+      datumToString (AsciiString a) = ascii_to_string a
+      datumToString _ = ""
+   in TrackStatus tsbpm tsply tspos tslpn tsblk
+
+flowers :: Udp -> IO ()
+flowers conn = forever $ do
+  liftIO $ udp_send_packet conn (Packet_Message (message "/flowers" []))
+  threadDelay 33333 -- 1/30 of a second
+
+nksall :: IORef TrackStatus -> Udp -> IO ()
+nksall ref conn = forever $ do
+  msg <- liftIO $ waitAddress conn "/nks/all"
+  case msg of
+    Packet_Message m -> atomicWriteIORef ref (messageToTrackStatus m) 
+    Packet_Bundle _ -> return ()
 
 main :: IO ()
 main = do
   (one, two) <- initScript
   cfg <- standardIOConfig
   vty <- mkVty cfg
-  deck1 <- openUdp one rnsServerPort -- these will be asked for on startup later
+  deck1 <- openUdp one rnsServerPort -- unduplicate all this?
   deck2 <- openUdp two rnsServerPort
-  buffer1 <- newIORef ""
-  buffer2 <- newIORef ""
+  buffer1 <- newIORef (TrackStatus 0 "" "" "" "")
+  buffer2 <- newIORef (TrackStatus 0 "" "" "" "")
+  _ <- forkIO $ openUdp one nksServerPort >>= flowers
+  _ <- forkIO $ openUdp two nksServerPort >>= flowers
+  _ <- forkIO $ openUdp one nksClientPort >>= nksall buffer1
+  _ <- forkIO $ openUdp two nksClientPort >>= nksall buffer2
   _ <- execRWST (vtyGO False) vty (dsEmpty { socket = deck1, buffer = buffer1 }, dsEmpty { socket = deck2, buffer = buffer2 })
   shutdown vty
 
@@ -109,7 +148,15 @@ vtyGO shouldWeExit = do
   unless shouldWeExit $ handleEvent >>= vtyGO
 
 updateDisplay :: App ()
-updateDisplay = undefined
+updateDisplay = do
+  displayRegion@(dw,dh) <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
+  vty <- ask
+  ds <- get
+  let (b1, b2) = bimap buffer buffer ds
+  one <- liftIO $ readIORef b1
+  two <- liftIO $ readIORef b2
+  let pic = picForImage $ Vty.string defAttr $ show one ++ show two
+  liftIO $ update vty pic
 
 handleEvent :: App Bool
 handleEvent = do
@@ -118,8 +165,8 @@ handleEvent = do
   let (d1, d2) = bimap socket socket ds
   ev <- liftIO $ nextEventNonblocking vty 
   case ev of
-    Nothing -> do -- poll for osc
-      return True
+    Nothing -> do -- update deck state from track status
+      return False
     Just k -> do
       runKeyCommand $ case k of
         -- deck 1
