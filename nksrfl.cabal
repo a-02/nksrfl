@@ -27,6 +27,8 @@ executable nksrfl
       vty,
       transformers,
       these,
-      containers
+      containers,
+      async,
+      async-extra
     hs-source-dirs:   app
     default-language: Haskell2010

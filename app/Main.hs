@@ -6,6 +6,8 @@
 module Main where
 
 import Control.Concurrent
+import Control.Concurrent.Async
+import Control.Concurrent.Async.Timer
 import Control.Monad.Trans.RWS.Lazy
 import Control.Monad
 import Control.Monad.IO.Class
@@ -121,9 +123,9 @@ flowers conn = forever $ do
 
 nksall :: IORef TrackStatus -> Udp -> IO ()
 nksall ref conn = forever $ do
-  msg <- liftIO $ waitAddress conn "/nks/all"
+  msg <- liftIO $ udp_recv_packet conn
   case msg of
-    Packet_Message m -> atomicWriteIORef ref (messageToTrackStatus m) 
+    Packet_Message m -> writeIORef ref (messageToTrackStatus m) 
     Packet_Bundle _ -> return ()
 
 main :: IO ()
