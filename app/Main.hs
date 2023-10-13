@@ -7,12 +7,12 @@ module Main where
 
 import Control.Concurrent
 import Control.Concurrent.Async
-import Control.Concurrent.Async.Timer
 import Control.Monad.Trans.RWS.Lazy
 import Control.Monad
 import Control.Monad.IO.Class
 
 import Data.Bifunctor
+import Data.Biapplicative
 import Data.Foldable (toList)
 import Data.IORef
 import Data.These
@@ -39,9 +39,12 @@ import Sound.Osc.Transport.Fd as Fd
    
 type App = RWST Vty () (DeckState,DeckState) IO
 
+instance Show Udp where
+  show _ = "udp connections dont have show instances"
+
 data DeckState = DeckState {
   socket :: Udp,
-  buffer :: IORef TrackStatus,
+  client :: Udp,
   bpm :: Maybe Int,
   pattern :: Maybe Int,
   row :: Maybe Int,
@@ -51,12 +54,12 @@ data DeckState = DeckState {
   blockSize :: Maybe BlockSize,
   transpose :: Int,
   songName :: String
-  } 
+  } deriving Show
 
 dsEmpty :: DeckState
 dsEmpty = DeckState {
     socket = undefined,
-    buffer = undefined,
+    client = undefined,
     bpm = Nothing,
     pattern = Nothing,
     row = Nothing,
@@ -76,7 +79,7 @@ data TrackStatus = TrackStatus {
   trackBlockLooping :: String
 } deriving Show
 
-data BlockSize = Half | Quarter | Eighth | Sixteenth
+data BlockSize = Half | Quarter | Eighth | Sixteenth deriving Show
 
 unBlockSize :: BlockSize -> Int
 unBlockSize = \case 
@@ -121,12 +124,12 @@ flowers conn = forever $ do
   liftIO $ udp_send_packet conn (Packet_Message (message "/flowers" []))
   threadDelay 33333 -- 1/30 of a second
 
-nksall :: IORef TrackStatus -> Udp -> IO ()
-nksall ref conn = forever $ do
+nksall :: Udp -> IO TrackStatus
+nksall conn = do
   msg <- liftIO $ udp_recv_packet conn
   case msg of
-    Packet_Message m -> writeIORef ref (messageToTrackStatus m) 
-    Packet_Bundle _ -> return ()
+    Packet_Message m -> return (messageToTrackStatus m) 
+    Packet_Bundle _ -> error "what"
 
 main :: IO ()
 main = do
@@ -135,13 +138,10 @@ main = do
   vty <- mkVty cfg
   deck1 <- openUdp one rnsServerPort -- unduplicate all this?
   deck2 <- openUdp two rnsServerPort
-  buffer1 <- newIORef (TrackStatus 0 "" "" "" "")
-  buffer2 <- newIORef (TrackStatus 0 "" "" "" "")
-  _ <- forkIO $ openUdp one nksServerPort >>= flowers
-  _ <- forkIO $ openUdp two nksServerPort >>= flowers
-  _ <- forkIO $ openUdp one nksClientPort >>= nksall buffer1
-  _ <- forkIO $ openUdp two nksClientPort >>= nksall buffer2
-  _ <- execRWST (vtyGO False) vty (dsEmpty { socket = deck1, buffer = buffer1 }, dsEmpty { socket = deck2, buffer = buffer2 })
+  client1 <- openUdp one nksClientPort
+  client2 <- openUdp two nksClientPort
+  _ <- race_ (openUdp one nksServerPort >>= flowers) (openUdp two nksServerPort >>= flowers)
+  _ <- execRWST (vtyGO False) vty (dsEmpty { socket = deck1, client = client1 }, dsEmpty { socket = deck2, client = client2 })
   shutdown vty
 
 vtyGO :: Bool -> App ()
@@ -154,21 +154,24 @@ updateDisplay = do
   displayRegion@(dw,dh) <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
   vty <- ask
   ds <- get
-  let (b1, b2) = bimap buffer buffer ds
-  one <- liftIO $ readIORef b1
-  two <- liftIO $ readIORef b2
-  let pic = picForImage $ Vty.string defAttr $ show one ++ show two
+  let pic = picForImage $ Vty.string defAttr $ show ds
   liftIO $ update vty pic
+
+updateDeckState :: TrackStatus -> DeckState -> DeckState
+updateDeckState ts ds = undefined
 
 handleEvent :: App Bool
 handleEvent = do
   vty <- ask
   ds <- get
-  let (d1, d2) = bimap socket socket ds
+  let d@(d1, d2) = bimap socket socket ds
+      (c1, c2) = bimap client client ds
   ev <- liftIO $ nextEventNonblocking vty 
   case ev of
     Nothing -> do -- update deck state from track status
-      return False
+        r@(r1, r2) <- liftIO $ concurrently (nksall c1) (nksall c2)
+        modify $ biliftA2 updateDeckState updateDeckState r
+        return False
     Just k -> do
       runKeyCommand $ case k of
         -- deck 1

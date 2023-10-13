@@ -29,6 +29,7 @@ executable nksrfl
       these,
       containers,
       async,
-      async-extra
+      async-extra,
+      bifunctors
     hs-source-dirs:   app
     default-language: Haskell2010
