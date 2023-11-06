@@ -45,9 +45,9 @@ instance Show Udp where
 data DeckState = DeckState {
   socket :: Udp,
   client :: Udp,
-  bpm :: Maybe Int,
-  pattern :: Maybe Int,
-  row :: Maybe Int,
+  bpm :: Maybe Float,
+  pattern :: Int,
+  row :: Int,
   playing :: Bool,
   looping :: Bool,
   blockLooping :: Bool,
@@ -61,8 +61,8 @@ dsEmpty = DeckState {
     socket = undefined,
     client = undefined,
     bpm = Nothing,
-    pattern = Nothing,
-    row = Nothing,
+    pattern = 0,
+    row = 0,
     playing = False,
     looping = False,
     blockLooping = False,
@@ -157,8 +157,26 @@ updateDisplay = do
   let pic = picForImage $ Vty.string defAttr $ show ds
   liftIO $ update vty pic
 
+patternParse :: String -> (Int,Int)
+patternParse pos =
+  let (xs,ys) = span (== ',') pos
+      zs = drop 2 ys
+   in bimap read read (xs,zs)
+
+readBool :: String -> Bool
+readBool "true" = True
+readBool _ = False
+
 updateDeckState :: TrackStatus -> DeckState -> DeckState
-updateDeckState ts ds = undefined
+updateDeckState ts ds = ds {
+  bpm = Just $ trackBpm ts,
+  playing = readBool $ trackPlaying ts,
+  looping = readBool $ trackLooping ts,
+  blockLooping = readBool $ trackBlockLooping ts,
+  pattern = fst parsed,
+  row = snd parsed
+  } where parsed = patternParse $ trackPosition ts
+  
 
 handleEvent :: App Bool
 handleEvent = do
@@ -235,9 +253,9 @@ data KeyCommand =
   Queue DeckSockets Int |
   BlockLoop DeckSockets |
   BlockLoopSize DeckSockets (Maybe BlockSize) |
-  BPM DeckSockets Int |
-  Faster DeckSockets Int |
-  Slower DeckSockets Int |
+  BPM DeckSockets Float |
+  Faster DeckSockets Float |
+  Slower DeckSockets Float |
   Transpose DeckSockets Int |
   None
 
@@ -262,7 +280,7 @@ runKeyCommand = \case
   BPM ds i -> mergeTheseWith (setBPM i) (setBPM i) (*>) ds
   Faster ds i -> do
     (d1, d2) <- get
-    mergeTheseWith (setBPM $ maybe 0 (+ i) d1.bpm) (setBPM $ maybe 0 (+ i) d2.bpm) (*>) ds
+    mergeTheseWith (setBPM $ maybe 0.0 (+ i) d1.bpm) (setBPM $ maybe 0.0 (+ i) d2.bpm) (*>) ds
   Slower ds i -> do
     (d1, d2) <- get
     mergeTheseWith 
@@ -318,8 +336,8 @@ queue i conn = do
   let queueMessage = "renoise.song().transport:add_scheduled_sequence(" ++ show i ++ ")"
   liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/evaluate" [AsciiString $ ascii queueMessage]))
 
-setBPM :: Int -> Udp -> App ()
-setBPM i conn = liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/song/bpm" [Int32 $ fromIntegral i]))
+setBPM :: Float -> Udp -> App ()
+setBPM i conn = liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/song/bpm" [Float i]))
 
 setTranspose :: Int -> Udp -> App ()
 setTranspose i conn = do
