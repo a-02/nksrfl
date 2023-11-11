@@ -12,19 +12,23 @@ import Control.Monad
 import Control.Monad.IO.Class
 
 import Data.Bifunctor
-import Data.Biapplicative
+import Data.Bitraversable
 import Data.Foldable (toList)
-import Data.IORef
 import Data.These
 import qualified Data.Sequence as Seq
 
-import Graphics.Vty as Vty
-import Graphics.Vty.Image as Vty
+import GHC.Conc
 
-import Sound.Osc.Datum
+import Graphics.Vty as Vty
+-- import Graphics.Vty.Image as Vty
+
 import Sound.Osc.Packet
 import Sound.Osc.Transport.Fd.Udp
 import Sound.Osc.Transport.Fd as Fd
+
+import Command
+import Pattern
+import Types
 
 {-
    The connections here are all over the place.
@@ -37,57 +41,6 @@ import Sound.Osc.Transport.Fd as Fd
    Track status gets sent over /nks/all.
 -}
    
-type App = RWST Vty () (DeckState,DeckState) IO
-
-instance Show Udp where
-  show _ = "udp connections dont have show instances"
-
-data DeckState = DeckState {
-  socket :: Udp,
-  client :: Udp,
-  bpm :: Maybe Float,
-  pattern :: Int,
-  row :: Int,
-  playing :: Bool,
-  looping :: Bool,
-  blockLooping :: Bool,
-  blockSize :: Maybe BlockSize,
-  transpose :: Int,
-  songName :: String
-  } deriving Show
-
-dsEmpty :: DeckState
-dsEmpty = DeckState {
-    socket = undefined,
-    client = undefined,
-    bpm = Nothing,
-    pattern = 0,
-    row = 0,
-    playing = False,
-    looping = False,
-    blockLooping = False,
-    blockSize = Nothing,
-    transpose = 0,
-    songName = ""
-  }
-
-data TrackStatus = TrackStatus {
-  trackBpm :: Float,
-  trackPlaying :: String,
-  trackPosition :: String,
-  trackLooping :: String,
-  trackBlockLooping :: String
-} deriving Show
-
-data BlockSize = Half | Quarter | Eighth | Sixteenth deriving Show
-
-unBlockSize :: BlockSize -> Int
-unBlockSize = \case 
-  Half -> 2
-  Quarter -> 4
-  Eighth -> 8
-  Sixteenth -> 16
-
 initScript :: IO (String, String)
 initScript = do
   putStrLn "deck 1 ip"
@@ -96,41 +49,6 @@ initScript = do
   two <- getLine
   return (one, two)
 
-rnsServerPort :: Int 
-rnsServerPort = 6066
-nksServerPort :: Int
-nksServerPort = 8088
-nksClientPort :: Int
-nksClientPort = 9099
-
-messageToTrackStatus :: Message -> TrackStatus
-messageToTrackStatus msg = 
-  let datum = messageDatum msg
-      tsbpm = datumToFloat $ head datum
-      tsply = datumToString $ datum !! 1
-      tspos = datumToString $ datum !! 2
-      tslpn = datumToString $ datum !! 3
-      tsblk = datumToString $ datum !! 4
-      datumToFloat :: Datum -> Float
-      datumToFloat (Float f) = f
-      datumToFloat _ = 0
-      datumToString :: Datum -> String
-      datumToString (AsciiString a) = ascii_to_string a
-      datumToString _ = ""
-   in TrackStatus tsbpm tsply tspos tslpn tsblk
-
-flowers :: Udp -> IO ()
-flowers conn = forever $ do
-  liftIO $ udp_send_packet conn (Packet_Message (message "/flowers" []))
-  threadDelay 33333 -- 1/30 of a second
-
-nksall :: Udp -> IO TrackStatus
-nksall conn = do
-  msg <- liftIO $ udp_recv_packet conn
-  case msg of
-    Packet_Message m -> return (messageToTrackStatus m) 
-    Packet_Bundle _ -> error "what"
-
 main :: IO ()
 main = do
   (one, two) <- initScript
@@ -138,11 +56,48 @@ main = do
   vty <- mkVty cfg
   deck1 <- openUdp one rnsServerPort -- unduplicate all this?
   deck2 <- openUdp two rnsServerPort
+  let sendFlowers = 
+        race_ (openUdp one nksServerPort >>= flowers) (openUdp two nksServerPort >>= flowers)
+      deckstate1 = dsEmpty { socket = deck1 }
+      deckstate2 = dsEmpty { socket = deck2 }
+  dsTVar1 <- newTVarIO deckstate1
+  dsTVar2 <- newTVarIO deckstate2
   client1 <- openUdp one nksClientPort
   client2 <- openUdp two nksClientPort
-  _ <- race_ (openUdp one nksServerPort >>= flowers) (openUdp two nksServerPort >>= flowers)
-  _ <- execRWST (vtyGO False) vty (dsEmpty { socket = deck1, client = client1 }, dsEmpty { socket = deck2, client = client2 })
+  let receiveGifts = gifts dsTVar1 dsTVar2 one two client1 client2
+      program = execRWST (vtyGO False) vty (dsTVar1, dsTVar2)
+  _ <- withAsync (concurrently sendFlowers receiveGifts) (const program)
   shutdown vty
+
+flowers :: Udp -> IO ()
+flowers conn = forever $ do
+  liftIO $ udp_send_packet conn (Packet_Message (message "/flowers" []))
+  threadDelay 50000 -- 1/20 of a second
+
+-- todo: skip the TrackStatus step, make the entirety of DeckState fully
+-- readable from each OSC message
+gifts :: 
+  TVar DeckState -> 
+  TVar DeckState -> 
+  Address_Pattern -> 
+  Address_Pattern -> 
+  Udp -> 
+  Udp -> 
+  IO ()
+gifts ds1 ds2 address1 address2 udp1 udp2 = forever $ do
+  (res1, res2) <- concurrently 
+      (waitAddress udp1 address1)
+      (waitAddress udp2 address2)
+  let ts1 = packetToTrackStatus res1
+      ts2 = packetToTrackStatus res2
+  atomically $ do
+    oldState1 <- readTVar ds1
+    oldState2 <- readTVar ds2
+    writeTVar ds1 (updateDeckState ts1 oldState1)
+    writeTVar ds2 (updateDeckState ts2 oldState2)
+  
+
+
 
 vtyGO :: Bool -> App ()
 vtyGO shouldWeExit = do
@@ -151,21 +106,12 @@ vtyGO shouldWeExit = do
 
 updateDisplay :: App ()
 updateDisplay = do
-  displayRegion@(dw,dh) <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
+  --displayRegion@(dw,dh) <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
   vty <- ask
-  ds <- get
-  let pic = picForImage $ Vty.string defAttr $ show ds
+  -- ds <- get
+  let pic = picForImage $ Vty.string defAttr "hello?"
   liftIO $ update vty pic
 
-patternParse :: String -> (Int,Int)
-patternParse pos =
-  let (xs,ys) = span (== ',') pos
-      zs = drop 2 ys
-   in bimap read read (xs,zs)
-
-readBool :: String -> Bool
-readBool "true" = True
-readBool _ = False
 
 updateDeckState :: TrackStatus -> DeckState -> DeckState
 updateDeckState ts ds = ds {
@@ -181,17 +127,13 @@ updateDeckState ts ds = ds {
 handleEvent :: App Bool
 handleEvent = do
   vty <- ask
-  ds <- get
-  let d@(d1, d2) = bimap socket socket ds
-      (c1, c2) = bimap client client ds
-  ev <- liftIO $ nextEventNonblocking vty 
+  tvar <- get
+  ds <- liftIO $ bitraverse readTVarIO readTVarIO tvar -- woah!
+  let (d1, d2) = bimap socket socket ds
+  ev <- liftIO $ nextEvent vty 
   case ev of
-    Nothing -> do -- update deck state from track status
-        r@(r1, r2) <- liftIO $ concurrently (nksall c1) (nksall c2)
-        modify $ biliftA2 updateDeckState updateDeckState r
-        return False
-    Just k -> do
-      runKeyCommand $ case k of
+    k -> do
+      runKeyCommand ds $ case k of
         -- deck 1
         EvKey (KChar 'q') [] -> Start (This d1)
         EvKey (KChar 'w') [] -> Stop (This d1)
@@ -228,7 +170,7 @@ handleEvent = do
         EvKey (KChar 'Q') [] -> Start (These d1 d2)
         EvKey (KChar 'W') [] -> Stop (These d1 d2)
         EvKey (KChar 'E') [] -> Loop (These d1 d2)
-        EvKey (KChar 'R') [] -> Load (These d1 d2)
+        EvKey (KChar 'R') [] -> Load (These d2 d2)
         EvKey (KChar 'T') [] -> Queue (These d1 d2) 1 -- add this to deckstate!
         EvKey (KChar 'A') [] -> BlockLoop (These d1 d2)
         EvKey (KChar 'S') [] -> BlockLoopSize (These d1 d2) (blockSize $ fst ds)
@@ -243,28 +185,12 @@ handleEvent = do
         _ -> None
       return $ k == EvKey KEsc [] 
 
-type DeckSockets = These Udp Udp
 
-data KeyCommand = 
-  Start DeckSockets |
-  Stop DeckSockets |
-  Loop DeckSockets |
-  Load DeckSockets |
-  Queue DeckSockets Int |
-  BlockLoop DeckSockets |
-  BlockLoopSize DeckSockets (Maybe BlockSize) |
-  BPM DeckSockets Float |
-  Faster DeckSockets Float |
-  Slower DeckSockets Float |
-  Transpose DeckSockets Int |
-  None
-
-runKeyCommand :: KeyCommand -> App ()
-runKeyCommand = \case
+runKeyCommand :: (DeckState, DeckState) -> KeyCommand -> App ()
+runKeyCommand (d1, d2) = \case
   Start ds -> mergeTheseWith start start (*>) ds
   Stop ds -> mergeTheseWith stop stop (*>) ds
   Loop ds -> do
-    (d1, d2) <- get
     mergeTheseWith (loop $ not d1.looping) (loop $ not d2.looping) (*>) ds
   Load ds -> do
     vty <- ask
@@ -273,22 +199,18 @@ runKeyCommand = \case
     mergeTheseWith (load fp) (load fp) (*>) ds
   Queue ds i -> mergeTheseWith (queue i) (queue i) (*>) ds
   BlockLoop ds -> do
-    (d1, d2) <- get
     mergeTheseWith (blockLoop $ not d1.blockLooping) (blockLoop $ not d2.blockLooping) (*>) ds
   BlockLoopSize ds bs -> do
     mergeTheseWith (blockLoopSize bs) (blockLoopSize bs) (*>) ds
   BPM ds i -> mergeTheseWith (setBPM i) (setBPM i) (*>) ds
   Faster ds i -> do
-    (d1, d2) <- get
     mergeTheseWith (setBPM $ maybe 0.0 (+ i) d1.bpm) (setBPM $ maybe 0.0 (+ i) d2.bpm) (*>) ds
   Slower ds i -> do
-    (d1, d2) <- get
     mergeTheseWith 
      (setBPM $ maybe 0 (\x -> x - i) d1.bpm) 
      (setBPM $ maybe 0 (\x -> x - i) d2.bpm) 
      (*>) ds
   Transpose ds i -> do
-    (d1, d2) <- get
     mergeTheseWith
       (setTranspose $ d1.transpose + i)
       (setTranspose $ d2.transpose + i)
@@ -311,58 +233,3 @@ handleBreakoutEvent = do
     EvKey KEnter [] -> return True
     EvKey KEsc [] -> put Nothing >> return True
     _ -> return False
-
-
-start :: Udp -> App ()
-start conn = liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/transport/start" []))
-
-stop :: Udp -> App ()
-stop conn = liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/transport/stop" []))
-
-loop :: Bool -> Udp -> App ()
-loop b conn = liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/transport/loop/pattern" [oscBool b]))
-
-load :: Maybe FilePath -> Udp -> App ()
-load maybeFp conn = case maybeFp of -- easier to read this way
-  Nothing -> return ()
-  Just fp -> do
-    let loadMessage x = "renoise.app():load_song(" ++ x ++ ")"
-        saveMessage = "renoise.app():save_song_as(/dev/null)"
-    liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/evaluate" [AsciiString $ ascii saveMessage])) -- this wont work on windows!
-    liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/evaluate" [AsciiString . ascii $ loadMessage fp]))
-
-queue :: Int -> Udp -> App ()
-queue i conn = do
-  let queueMessage = "renoise.song().transport:add_scheduled_sequence(" ++ show i ++ ")"
-  liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/evaluate" [AsciiString $ ascii queueMessage]))
-
-setBPM :: Float -> Udp -> App ()
-setBPM i conn = liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/song/bpm" [Float i]))
-
-setTranspose :: Int -> Udp -> App ()
-setTranspose i conn = do
-  let transposeMessage = "renoise.song().instruments[].transpose = " ++ show i
-  liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/evaluate" [AsciiString $ ascii transposeMessage]))
-
-blockLoop :: Bool -> Udp -> App ()
-blockLoop b conn = liftIO $ udp_send_packet conn (Packet_Message (message "renoise/transport/loop/block" [oscBool b]))
-
-blockLoopSize :: Maybe BlockSize -> Udp -> App ()
-blockLoopSize bs conn = do
-  let size = maybe 8 unBlockSize bs -- Default to 1/8 if blocksize hasn't been set by anything.
-      bsMessage = "renoise.song().transport.loop_block_range_coeff = " ++ show size
-  liftIO $ udp_send_packet conn (Packet_Message (message "/renoise/evaluate" [AsciiString $ ascii bsMessage]))
-
--- blockSize
-
-oscBool :: Bool -> Datum
-oscBool True = AsciiString $ ascii "true"
-oscBool False = AsciiString $ ascii "false"
-
-{-
-main :: IO ()
-main = do
-  let server = openUdp "10.0.0.197" 2345 -- snake case? in haskell? who wrote this library?
-  Fd.withTransport server (\fd -> Fd.sendMessage fd (message "/renoise/evaluate" [AsciiString "1 + 1"]))
-  return ()
--}

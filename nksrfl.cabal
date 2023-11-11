@@ -14,12 +14,12 @@ extra-doc-files:    CHANGELOG.md
 -- extra-source-files:
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -Wall -threaded
 
 executable nksrfl
     import:           warnings
     main-is:          Main.hs
-    -- other-modules:
+    other-modules:    Types, Pattern, Command
     -- other-extensions:
     build-depends:    
       base ^>=4.17.2.0,
