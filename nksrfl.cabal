@@ -30,6 +30,9 @@ executable nksrfl
       containers,
       async,
       async-extra,
-      bifunctors
+      bifunctors,
+      co-log-core,
+      time,
+      text
     hs-source-dirs:   app
     default-language: Haskell2010

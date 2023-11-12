@@ -1,30 +1,36 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Main where
 
+import Colog.Core.Action
+import Colog.Core.IO
+
 import Control.Concurrent
 import Control.Concurrent.Async
-import Control.Monad.Trans.RWS.Lazy
 import Control.Monad
 import Control.Monad.IO.Class
+import Control.Monad.Trans.RWS.Strict
 
 import Data.Bifunctor
 import Data.Bitraversable
 import Data.Foldable (toList)
-import Data.These
 import qualified Data.Sequence as Seq
+import Data.These
+import Data.Time.Clock
 
 import GHC.Conc
 
 import Graphics.Vty as Vty
+
 -- import Graphics.Vty.Image as Vty
 
 import Sound.Osc.Packet
-import Sound.Osc.Transport.Fd.Udp
 import Sound.Osc.Transport.Fd as Fd
+import Sound.Osc.Transport.Fd.Udp
+
+import System.IO
 
 import Command
 import Pattern
@@ -35,12 +41,12 @@ import Types
    NKSRFL sends OSC messages to Renoise over port 6066.
    NKSTool waits for any OSC message on port 8088,
      then returns the current "track status" on port 9099.
-   NKSRFL keeps "track status" in an IORef. 
+   NKSRFL keeps "track status" in a TVar.
    While technically any message can be put over 8088,
      we use "/flowers []" here.
    Track status gets sent over /nks/all.
 -}
-   
+
 initScript :: IO (String, String)
 initScript = do
   putStrLn "deck 1 ip"
@@ -51,21 +57,24 @@ initScript = do
 
 main :: IO ()
 main = do
+  now <- getCurrentTime
+  let filename = "" ++ show now
+  logHandle <- openFile filename WriteMode
   (one, two) <- initScript
   cfg <- standardIOConfig
   vty <- mkVty cfg
   deck1 <- openUdp one rnsServerPort -- unduplicate all this?
   deck2 <- openUdp two rnsServerPort
-  let sendFlowers = 
+  let sendFlowers =
         race_ (openUdp one nksServerPort >>= flowers) (openUdp two nksServerPort >>= flowers)
-      deckstate1 = dsEmpty { socket = deck1 }
-      deckstate2 = dsEmpty { socket = deck2 }
+      deckstate1 = dsEmpty{socket = deck1}
+      deckstate2 = dsEmpty{socket = deck2}
   dsTVar1 <- newTVarIO deckstate1
   dsTVar2 <- newTVarIO deckstate2
   client1 <- openUdp one nksClientPort
   client2 <- openUdp two nksClientPort
   let receiveGifts = gifts dsTVar1 dsTVar2 one two client1 client2
-      program = execRWST (vtyGO False) vty (dsTVar1, dsTVar2)
+      program = execRWST (vtyGO False) (vty, logHandle) (dsTVar1, dsTVar2)
   _ <- withAsync (concurrently sendFlowers receiveGifts) (const program)
   shutdown vty
 
@@ -76,16 +85,17 @@ flowers conn = forever $ do
 
 -- todo: skip the TrackStatus step, make the entirety of DeckState fully
 -- readable from each OSC message
-gifts :: 
-  TVar DeckState -> 
-  TVar DeckState -> 
-  Address_Pattern -> 
-  Address_Pattern -> 
-  Udp -> 
-  Udp -> 
+gifts ::
+  TVar DeckState ->
+  TVar DeckState ->
+  Address_Pattern ->
+  Address_Pattern ->
+  Udp ->
+  Udp ->
   IO ()
 gifts ds1 ds2 address1 address2 udp1 udp2 = forever $ do
-  (res1, res2) <- concurrently 
+  (res1, res2) <-
+    concurrently
       (waitAddress udp1 address1)
       (waitAddress udp2 address2)
   let ts1 = packetToTrackStatus res1
@@ -95,42 +105,49 @@ gifts ds1 ds2 address1 address2 udp1 udp2 = forever $ do
     oldState2 <- readTVar ds2
     writeTVar ds1 (updateDeckState ts1 oldState1)
     writeTVar ds2 (updateDeckState ts2 oldState2)
-  
-
-
 
 vtyGO :: Bool -> App ()
 vtyGO shouldWeExit = do
+  handle <- snd <$> ask
+  logStringHandle handle <& "calling updateDisplay"
   updateDisplay
   unless shouldWeExit $ handleEvent >>= vtyGO
 
 updateDisplay :: App ()
 updateDisplay = do
-  --displayRegion@(dw,dh) <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
-  vty <- ask
-  -- ds <- get
-  let pic = picForImage $ Vty.string defAttr "hello?"
+  (vty, handle) <- ask
+  logStringHandle handle <& "finding display region"
+  displayRegion <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
+  logStringHandle handle <& ("display region is " ++ show displayRegion)
+  tvar <- get
+  (ds1,ds2) <- liftIO $ bitraverse readTVarIO readTVarIO tvar -- woah!
+  logStringHandle handle <& "generating picture, running update"
+  let img1 = string (defAttr `withForeColor` magenta) (show ds1)
+      img2 = string (defAttr `withForeColor` cyan) (show ds2)
+      pic = picForImage $ img1 <|> img2
   liftIO $ update vty pic
 
-
 updateDeckState :: TrackStatus -> DeckState -> DeckState
-updateDeckState ts ds = ds {
-  bpm = Just $ trackBpm ts,
-  playing = readBool $ trackPlaying ts,
-  looping = readBool $ trackLooping ts,
-  blockLooping = readBool $ trackBlockLooping ts,
-  pattern = fst parsed,
-  row = snd parsed
-  } where parsed = patternParse $ trackPosition ts
-  
+updateDeckState ts ds =
+  ds
+    { bpm = Just $ trackBpm ts
+    , playing = readBool $ trackPlaying ts
+    , looping = readBool $ trackLooping ts
+    , blockLooping = readBool $ trackBlockLooping ts
+    , pattern = fst parsed
+    , row = snd parsed
+    }
+ where
+  parsed = patternParse $ trackPosition ts
 
 handleEvent :: App Bool
 handleEvent = do
-  vty <- ask
+  (vty, handle) <- ask
   tvar <- get
   ds <- liftIO $ bitraverse readTVarIO readTVarIO tvar -- woah!
   let (d1, d2) = bimap socket socket ds
-  ev <- liftIO $ nextEvent vty 
+  logStringHandle handle <& "waiting for next event"
+  ev <- liftIO $ nextEvent vty
   case ev of
     k -> do
       runKeyCommand ds $ case k of
@@ -183,39 +200,42 @@ handleEvent = do
         EvKey (KChar 'V') [] -> None
         EvKey (KChar 'B') [] -> None
         _ -> None
-      return $ k == EvKey KEsc [] 
-
+      return $ k == EvKey KEsc []
 
 runKeyCommand :: (DeckState, DeckState) -> KeyCommand -> App ()
-runKeyCommand (d1, d2) = \case
-  Start ds -> mergeTheseWith start start (*>) ds
-  Stop ds -> mergeTheseWith stop stop (*>) ds
-  Loop ds -> do
-    mergeTheseWith (loop $ not d1.looping) (loop $ not d2.looping) (*>) ds
-  Load ds -> do
-    vty <- ask
-    result <- liftIO $ execRWST (vtyLoadFile False) vty Nothing -- i think this is a mispattern?
-    let fp = fmap toList . fst $ result
-    mergeTheseWith (load fp) (load fp) (*>) ds
-  Queue ds i -> mergeTheseWith (queue i) (queue i) (*>) ds
-  BlockLoop ds -> do
-    mergeTheseWith (blockLoop $ not d1.blockLooping) (blockLoop $ not d2.blockLooping) (*>) ds
-  BlockLoopSize ds bs -> do
-    mergeTheseWith (blockLoopSize bs) (blockLoopSize bs) (*>) ds
-  BPM ds i -> mergeTheseWith (setBPM i) (setBPM i) (*>) ds
-  Faster ds i -> do
-    mergeTheseWith (setBPM $ maybe 0.0 (+ i) d1.bpm) (setBPM $ maybe 0.0 (+ i) d2.bpm) (*>) ds
-  Slower ds i -> do
-    mergeTheseWith 
-     (setBPM $ maybe 0 (\x -> x - i) d1.bpm) 
-     (setBPM $ maybe 0 (\x -> x - i) d2.bpm) 
-     (*>) ds
-  Transpose ds i -> do
-    mergeTheseWith
-      (setTranspose $ d1.transpose + i)
-      (setTranspose $ d2.transpose + i)
-      (*>) ds
-  None -> return ()
+runKeyCommand (d1, d2) kc = do
+  (vty, handle) <- ask
+  logStringHandle handle <& show kc
+  case kc of
+    None -> return ()
+    Start ds -> mergeTheseWith start start (*>) ds
+    Stop ds -> mergeTheseWith stop stop (*>) ds
+    Loop ds -> do
+      mergeTheseWith (loop $ not d1.looping) (loop $ not d2.looping) (*>) ds
+    Load ds -> do
+      result <- liftIO $ execRWST (vtyLoadFile False) vty Nothing -- i think this is a mispattern?
+      let fp = fmap toList . fst $ result
+      mergeTheseWith (load fp) (load fp) (*>) ds
+    Queue ds i -> mergeTheseWith (queue i) (queue i) (*>) ds
+    BlockLoop ds -> do
+      mergeTheseWith (blockLoop $ not d1.blockLooping) (blockLoop $ not d2.blockLooping) (*>) ds
+    BlockLoopSize ds bs -> do
+      mergeTheseWith (blockLoopSize bs) (blockLoopSize bs) (*>) ds
+    BPM ds i -> mergeTheseWith (setBPM i) (setBPM i) (*>) ds
+    Faster ds i -> do
+      mergeTheseWith (setBPM $ maybe 0.0 (+ i) d1.bpm) (setBPM $ maybe 0.0 (+ i) d2.bpm) (*>) ds
+    Slower ds i -> do
+      mergeTheseWith
+        (setBPM $ maybe 0 (\x -> x - i) d1.bpm)
+        (setBPM $ maybe 0 (\x -> x - i) d2.bpm)
+        (*>)
+        ds
+    Transpose ds i -> do
+      mergeTheseWith
+        (setTranspose $ d1.transpose + i)
+        (setTranspose $ d2.transpose + i)
+        (*>)
+        ds
 
 vtyLoadFile :: Bool -> RWST Vty () (Maybe (Seq.Seq Char)) IO ()
 vtyLoadFile shouldExit = do

@@ -1,0 +1,5 @@
+hey this is a bogstandard cabal project
+if you feel like using the flake to run this make sure you have nix installed first
+its "nix develop" to enter the dev shell
+"nix build" to... build. it
+"cabal run --ghc-options=threaded" because i still gotta put it in the .cabal file LOL
