@@ -3,9 +3,12 @@
 
 module Types where
 
-import Control.Monad.Trans.RWS.Lazy
+import Colog.Core.Action
+
+import Control.Monad.Trans.RWS.Strict
 
 import Data.These
+import Data.Text (Text)
 
 import Graphics.Vty
 
@@ -13,7 +16,9 @@ import GHC.Conc
 
 import Sound.Osc
 
-type App = RWST Vty () (TVar DeckState, TVar DeckState) IO
+import System.IO
+
+type App = RWST (Vty, Handle) (LogAction IO Text) (TVar DeckState, TVar DeckState) IO
 
 data DeckState = DeckState {
   socket :: Udp, -- sending OSC over 6066
@@ -98,3 +103,20 @@ data KeyCommand =
   Slower DeckSockets Float |
   Transpose DeckSockets Int |
   None
+
+instance Show KeyCommand where
+  show = \case 
+    Start ds -> unDeckSockets ds ++ "start"
+    Stop ds -> unDeckSockets ds ++ "stop"
+    Loop ds -> unDeckSockets ds ++ "loop"
+    Load ds -> unDeckSockets ds ++ "load"
+    Queue ds i -> unDeckSockets ds ++ "queue pattern " ++ show i
+    BlockLoop ds -> unDeckSockets ds ++ "block loop"
+    BlockLoopSize ds _ -> unDeckSockets ds ++ "block loop size"
+    BPM ds i -> unDeckSockets ds ++ "bpm" ++ show i
+    Faster ds i -> unDeckSockets ds ++ "faster" ++ show i
+    Slower ds i -> unDeckSockets ds ++ "slower" ++ show i
+    Transpose ds i -> unDeckSockets ds ++ "transpose" ++ show i
+    None -> "none"
+    where unDeckSockets = these (const "deck 1") (const "deck 2") (\_ _ -> "deck 1 & 2")
+
