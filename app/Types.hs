@@ -105,7 +105,7 @@ data KeyCommand =
   None
 
 instance Show KeyCommand where
-  show = \case 
+  show kc = "[COMMAND] :: " ++ case kc of
     Start ds -> unDeckSockets ds ++ "start"
     Stop ds -> unDeckSockets ds ++ "stop"
     Loop ds -> unDeckSockets ds ++ "loop"
@@ -113,10 +113,10 @@ instance Show KeyCommand where
     Queue ds i -> unDeckSockets ds ++ "queue pattern " ++ show i
     BlockLoop ds -> unDeckSockets ds ++ "block loop"
     BlockLoopSize ds _ -> unDeckSockets ds ++ "block loop size"
-    BPM ds i -> unDeckSockets ds ++ "bpm" ++ show i
-    Faster ds i -> unDeckSockets ds ++ "faster" ++ show i
-    Slower ds i -> unDeckSockets ds ++ "slower" ++ show i
-    Transpose ds i -> unDeckSockets ds ++ "transpose" ++ show i
+    BPM ds i -> unDeckSockets ds ++ "bpm " ++ show i
+    Faster ds i -> unDeckSockets ds ++ "faster " ++ show i
+    Slower ds i -> unDeckSockets ds ++ "slower " ++ show i
+    Transpose ds i -> unDeckSockets ds ++ "transpose " ++ show i
     None -> "none"
-    where unDeckSockets = these (const "deck 1") (const "deck 2") (\_ _ -> "deck 1 & 2")
+    where unDeckSockets = these (const "deck 1 ") (const "deck 2 ") (\_ _ -> "deck 1 & 2 ")
 

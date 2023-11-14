@@ -33,6 +33,8 @@ executable nksrfl
       bifunctors,
       co-log-core,
       time,
-      text
+      text,
+      directory,
+      network
     hs-source-dirs:   app
     default-language: Haskell2010

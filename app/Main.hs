@@ -18,11 +18,13 @@ import Data.Bitraversable
 import Data.Foldable (toList)
 import qualified Data.Sequence as Seq
 import Data.These
-import Data.Time.Clock
+import Data.Time
 
 import GHC.Conc
 
 import Graphics.Vty as Vty
+
+import Network.Socket hiding (socket, shutdown)
 
 -- import Graphics.Vty.Image as Vty
 
@@ -31,6 +33,7 @@ import Sound.Osc.Transport.Fd as Fd
 import Sound.Osc.Transport.Fd.Udp
 
 import System.IO
+import System.Directory
 
 import Command
 import Pattern
@@ -57,29 +60,41 @@ initScript = do
 
 main :: IO ()
 main = do
-  now <- getCurrentTime
-  let filename = "" ++ show now
-  logHandle <- openFile filename WriteMode
+  time <- getCurrentTime
+  let now = formatTime defaultTimeLocale "%F_%R" time
+      filename = "log/nksrfl_" ++ now
+      logMain = filename ++ "/main"
+      logFlowers = filename ++ "/flowers"
+      logGifts = filename ++ "/gifts"
+  createDirectoryIfMissing True filename
+  mainHandle <- openFile logMain WriteMode
+  flowersHandle <- openFile logFlowers WriteMode
+  giftsHandle <- openFile logGifts WriteMode
+  mapM_ (`hSetBuffering` NoBuffering) [mainHandle, flowersHandle, giftsHandle] 
   (one, two) <- initScript
+  logStringHandle mainHandle <& "initscript ran"
   cfg <- standardIOConfig
   vty <- mkVty cfg
   deck1 <- openUdp one rnsServerPort -- unduplicate all this?
   deck2 <- openUdp two rnsServerPort
   let sendFlowers =
-        race_ (openUdp one nksServerPort >>= flowers) (openUdp two nksServerPort >>= flowers)
+        race_ 
+          (openUdp one nksServerPort >>= flowers flowersHandle) 
+          (openUdp two nksServerPort >>= flowers flowersHandle)
       deckstate1 = dsEmpty{socket = deck1}
       deckstate2 = dsEmpty{socket = deck2}
   dsTVar1 <- newTVarIO deckstate1
   dsTVar2 <- newTVarIO deckstate2
   client1 <- openUdp one nksClientPort
   client2 <- openUdp two nksClientPort
-  let receiveGifts = gifts dsTVar1 dsTVar2 one two client1 client2
-      program = execRWST (vtyGO False) (vty, logHandle) (dsTVar1, dsTVar2)
+  let receiveGifts = gifts dsTVar1 dsTVar2 client1 client2 giftsHandle
+      program = execRWST (vtyGO False) (vty, mainHandle) (dsTVar1, dsTVar2)
   _ <- withAsync (concurrently sendFlowers receiveGifts) (const program)
   shutdown vty
 
-flowers :: Udp -> IO ()
-flowers conn = forever $ do
+flowers :: Handle -> Udp -> IO ()
+flowers handle conn = forever $ do
+  logStringHandle handle <& "sending flowers"
   liftIO $ udp_send_packet conn (Packet_Message (message "/flowers" []))
   threadDelay 50000 -- 1/20 of a second
 
@@ -88,23 +103,31 @@ flowers conn = forever $ do
 gifts ::
   TVar DeckState ->
   TVar DeckState ->
-  Address_Pattern ->
-  Address_Pattern ->
   Udp ->
   Udp ->
+  Handle ->
   IO ()
-gifts ds1 ds2 address1 address2 udp1 udp2 = forever $ do
-  (res1, res2) <-
-    concurrently
-      (waitAddress udp1 address1)
-      (waitAddress udp2 address2)
-  let ts1 = packetToTrackStatus res1
-      ts2 = packetToTrackStatus res2
-  atomically $ do
-    oldState1 <- readTVar ds1
-    oldState2 <- readTVar ds2
-    writeTVar ds1 (updateDeckState ts1 oldState1)
-    writeTVar ds2 (updateDeckState ts2 oldState2)
+gifts ds1 ds2 udp1 udp2 handle = forever $ do
+  logStringHandle handle <& "WAITING ON GIFTS"
+  socket1 <- getSocketName (udpSocket udp1)
+  withAsync
+    (concurrently (udp_recv_packet udp1) (udp_recv_packet udp2))
+    ( \a -> do
+        logStringHandle handle <& show socket1
+        logStringHandle handle <& ("\nwaiting for" ++ show (asyncThreadId a))
+        (res1, res2) <- wait a
+        logStringHandle handle <& ("got: " ++ show res1 ++ show res2)
+        let ts1 = packetToTrackStatus res1
+            ts2 = packetToTrackStatus res2
+        logStringHandle handle <& ("now: " ++ show ts1 ++ show ts2)
+        logStringHandle handle <& "updating tvars"
+        atomically $ do
+          oldState1 <- readTVar ds1
+          oldState2 <- readTVar ds2
+          writeTVar ds1 (updateDeckState ts1 oldState1)
+          writeTVar ds2 (updateDeckState ts2 oldState2)
+        logStringHandle handle <& "apparently done updating tvars"
+    )
 
 vtyGO :: Bool -> App ()
 vtyGO shouldWeExit = do
@@ -120,11 +143,13 @@ updateDisplay = do
   displayRegion <- liftIO $ (standardIOConfig >>= outputForConfig) >>= displayBounds -- wow!
   logStringHandle handle <& ("display region is " ++ show displayRegion)
   tvar <- get
-  (ds1,ds2) <- liftIO $ bitraverse readTVarIO readTVarIO tvar -- woah!
+  (ds1, ds2) <- liftIO $ bitraverse readTVarIO readTVarIO tvar -- woah!
   logStringHandle handle <& "generating picture, running update"
+  logStringHandle handle <& show ds1
+  logStringHandle handle <& show ds2
   let img1 = string (defAttr `withForeColor` magenta) (show ds1)
       img2 = string (defAttr `withForeColor` cyan) (show ds2)
-      pic = picForImage $ img1 <|> img2
+      pic = picForImage $ img1 <-> img2
   liftIO $ update vty pic
 
 updateDeckState :: TrackStatus -> DeckState -> DeckState
