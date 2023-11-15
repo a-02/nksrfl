@@ -1,12 +1,8 @@
-
 local OscMessage = renoise.Osc.Message
 local OscBundle = renoise.Osc.Bundle
 
 local server, socket_error = renoise.Socket.create_server(
-  "localhost", 8088, renoise.Socket.PROTOCOL_UDP)
-
-local client, socket_error = renoise.Socket.create_client(
-  "localhost", 9099, renoise.Socket.PROTOCOL_UDP)
+  8088, renoise.Socket.PROTOCOL_UDP)
 
 if (socket_error) then
   renoise.app():show_warning(("you fucked up: '%s'"):format(socket_error))
@@ -23,14 +19,18 @@ renoise.tool():add_menu_entry {
         local message_or_bundle, osc_error = renoise.Osc.from_binary_data(data)
         if (message_or_bundle) then
         print(("Got: '%s'"):format(tostring(message_or_bundle)))
-        oscClient();
+        print(socket.peer_port)
+        print(socket.peer_address)
+        local client, socket_error = renoise.Socket.create_client(
+          socket.peer_address, socket.peer_port, renoise.Socket.PROTOCOL_UDP)
+        oscClient(client);
       end
     end
   }
   end
 }
 
-function oscClient()
+function oscClient(client)
   local currentBpm = renoise.song().transport.bpm
   local isPlaying = renoise.song().transport.playing
   local songPosition = renoise.song().transport.playback_pos
