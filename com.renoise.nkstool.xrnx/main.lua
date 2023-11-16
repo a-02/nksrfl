@@ -1,12 +1,11 @@
-
 local OscMessage = renoise.Osc.Message
 local OscBundle = renoise.Osc.Bundle
 
 local server, socket_error = renoise.Socket.create_server(
-  "localhost", 8088, renoise.Socket.PROTOCOL_UDP)
+  8088, renoise.Socket.PROTOCOL_UDP)
 
 local client, socket_error = renoise.Socket.create_client(
-  "localhost", 9099, renoise.Socket.PROTOCOL_UDP)
+  9099, renoise.Socket.PROTOCOL_UDP)
 
 if (socket_error) then
   renoise.app():show_warning(("you fucked up: '%s'"):format(socket_error))
