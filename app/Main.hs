@@ -24,13 +24,10 @@ import GHC.Conc
 
 import Graphics.Vty as Vty
 
-import Network.Socket hiding (socket, shutdown)
-
 -- import Graphics.Vty.Image as Vty
 
 import Sound.Osc.Packet
-import Sound.Osc.Transport.Fd as Fd
-import Sound.Osc.Transport.Fd.Udp
+import Sound.Osc.Transport.Fd.Tcp
 
 import System.IO
 import System.Directory
@@ -40,16 +37,17 @@ import Pattern
 import Types
 
 {-
-   The connections here are all over the place.
-   NKSRFL sends OSC messages to Renoise over port 6066.
-   NKSTool waits for any OSC message on port 8088,
-     then returns the current "track status" on port 9099.
-   NKSRFL keeps "track status" in a TVar.
-   While technically any message can be put over 8088,
-     we use "/flowers []" here.
-   Track status gets sent over /nks/all.
+   Overview:
+   NKSRFL is a tool to control 2 Renoise applications simultaneously.
+   It translates keyboard inputs into OSC messages sent to each Renoise client.
+   This is done over port 6066.
+   Status of both Renoise clients (referred to as "decks") is kept track of by
+   repeatedly pinging Renoise over port 8088, and using an external Renoise plugin
+   to translate this into data out of Renoise.
 -}
 
+-- initscript: 
+-- ask for ip addresses to connect to
 initScript :: IO (String, String)
 initScript = do
   putStrLn "deck 1 ip"
@@ -58,10 +56,12 @@ initScript = do
   two <- getLine
   return (one, two)
 
+-- main:
+-- set up logging handles, spawn threads, then run the display
 main :: IO ()
 main = do
   time <- getCurrentTime
-  let now = formatTime defaultTimeLocale "%F_%R" time
+  let now = formatTime defaultTimeLocale "%s" time
       filename = "log/nksrfl_" ++ now
       logMain = filename ++ "/main"
       logFlowers = filename ++ "/flowers"
@@ -75,59 +75,53 @@ main = do
   logStringHandle mainHandle <& "initscript ran"
   cfg <- standardIOConfig
   vty <- mkVty cfg
-  deck1 <- openUdp one rnsServerPort -- unduplicate all this?
-  deck2 <- openUdp two rnsServerPort
+  deck1 <- openTcp one rnsServerPort -- unduplicate all this?
+  deck2 <- openTcp two rnsServerPort
+  tool1 <- openTcp one nksServerPort
+  tool2 <- openTcp two nksServerPort
   let sendFlowers =
         race_ 
-          (openUdp one nksServerPort >>= flowers flowersHandle) 
-          (openUdp two nksServerPort >>= flowers flowersHandle)
+          (flowers flowersHandle tool1) 
+          (flowers flowersHandle tool2)
       deckstate1 = dsEmpty{socket = deck1}
       deckstate2 = dsEmpty{socket = deck2}
   dsTVar1 <- newTVarIO deckstate1
   dsTVar2 <- newTVarIO deckstate2
-  client1 <- openUdp one nksClientPort
-  client2 <- openUdp two nksClientPort
-  let receiveGifts = gifts dsTVar1 dsTVar2 client1 client2 giftsHandle
+  let receiveGifts = gifts dsTVar1 dsTVar2 tool1 tool2 giftsHandle
       program = execRWST (vtyGO False) (vty, mainHandle) (dsTVar1, dsTVar2)
   _ <- withAsync (concurrently sendFlowers receiveGifts) (const program)
   shutdown vty
 
-flowers :: Handle -> Udp -> IO ()
+-- flowers:
+-- send an OSC message of "/flowers" to a renoise client listening at "conn"
+flowers :: Handle -> Tcp -> IO ()
 flowers handle conn = forever $ do
   logStringHandle handle <& "sending flowers"
-  liftIO $ udp_send_packet conn (Packet_Message (message "/flowers" []))
+  liftIO $ tcp_send_packet conn (Packet_Message (message "/flowers" []))
   threadDelay 50000 -- 1/20 of a second
 
--- todo: skip the TrackStatus step, make the entirety of DeckState fully
--- readable from each OSC message
 gifts ::
   TVar DeckState ->
   TVar DeckState ->
-  Udp ->
-  Udp ->
+  Tcp ->
+  Tcp ->
   Handle ->
   IO ()
-gifts ds1 ds2 udp1 udp2 handle = forever $ do
-  logStringHandle handle <& "WAITING ON GIFTS"
-  socket1 <- getSocketName (udpSocket udp1)
-  withAsync
-    (concurrently (udp_recv_packet udp1) (udp_recv_packet udp2))
-    ( \a -> do
-        logStringHandle handle <& show socket1
-        logStringHandle handle <& ("\nwaiting for" ++ show (asyncThreadId a))
-        (res1, res2) <- wait a
-        logStringHandle handle <& ("got: " ++ show res1 ++ show res2)
-        let ts1 = packetToTrackStatus res1
-            ts2 = packetToTrackStatus res2
-        logStringHandle handle <& ("now: " ++ show ts1 ++ show ts2)
-        logStringHandle handle <& "updating tvars"
-        atomically $ do
-          oldState1 <- readTVar ds1
-          oldState2 <- readTVar ds2
-          writeTVar ds1 (updateDeckState ts1 oldState1)
-          writeTVar ds2 (updateDeckState ts2 oldState2)
-        logStringHandle handle <& "apparently done updating tvars"
-    )
+gifts ds1 ds2 tcp1 tcp2 handle = forever $ do
+  logStringHandle handle <& "gettin me packets hopefully?"
+  res1 <- tcp_recv_packet tcp1
+  res2 <- tcp_recv_packet tcp2
+  logStringHandle handle <& ("got: " ++ show res1 ++ show res2)
+  let ts1 = packetToTrackStatus res1
+      ts2 = packetToTrackStatus res2
+  logStringHandle handle <& ("now: " ++ show ts1 ++ show ts2)
+  logStringHandle handle <& "updating tvars"
+  atomically $ do
+    oldState1 <- readTVar ds1
+    oldState2 <- readTVar ds2
+    writeTVar ds1 (updateDeckState ts1 oldState1)
+    writeTVar ds2 (updateDeckState ts2 oldState2)
+  logStringHandle handle <& "apparently done updating tvars"
 
 vtyGO :: Bool -> App ()
 vtyGO shouldWeExit = do

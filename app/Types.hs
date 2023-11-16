@@ -21,7 +21,7 @@ import System.IO
 type App = RWST (Vty, Handle) (LogAction IO Text) (TVar DeckState, TVar DeckState) IO
 
 data DeckState = DeckState {
-  socket :: Udp, -- sending OSC over 6066
+  socket :: Tcp, -- sending OSC over 6066
   bpm :: Maybe Float,
   pattern :: Int,
   row :: Int,
@@ -88,7 +88,7 @@ nksServerPort = 8088
 nksClientPort :: Int
 nksClientPort = 9099
 
-type DeckSockets = These Udp Udp
+type DeckSockets = These Tcp Tcp
 
 data KeyCommand = 
   Start DeckSockets |
